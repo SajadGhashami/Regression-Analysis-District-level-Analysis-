@@ -1,0 +1,253 @@
+---
+title: "Trend outlier"
+author: "Sajad Ghashami"
+date: "2/2/2022"
+output:
+  html_document:
+    code_folding: show
+    toc: TRUE
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## First specify the packages of interest
+packages = c("tidyverse", "lubridate", "DBI",
+             "tidymodels", "parsnip",  "rmarkdown", "knitr", "plotly", "modelr"  )
+
+## Now load or install&load all
+package.check <- lapply(
+  packages,
+  FUN = function(x) {
+    if (!require(x, character.only = TRUE)) {
+      install.packages(x, dependencies = TRUE)
+      library(x, character.only = TRUE)
+    }
+  }
+)
+
+
+```
+
+## Connecting to database and Pulling the data
+
+First we need to connect to database and pull the WAU/QUA for each day
+
+```{r mydata, message=TRUE, warning=TRUE}
+con <- DBI::dbConnect(odbc::odbc(),
+                      Driver       = "SnowflakeDSIIDriver",
+                      Server       = "ed87949.us-east-1.snowflakecomputing.com",
+                      UID          = rstudioapi::askForPassword("Database user"),
+                      PWD          = rstudioapi::askForPassword("Database password"),
+                      Database     = "EDW",
+                      Warehouse    = "INTEGRATE_LARGE_TEST",
+                      Schema       = "dim")
+mywh <- DBI::dbSendQuery(con, 'use role developer_role')
+mywh <- DBI::dbSendQuery(con, 'use warehouse INTEGRATE_LARGE_TEST')
+mydata <- DBI::dbGetQuery(con, "
+WITH a as (
+SELECT
+     tdac.user_id, 
+     tdac.CENSUS_DATE,
+     s.newsela_district_id,
+     s.state,
+     s.city,
+     s.county,
+     s.district_name,
+     sum(tdac.ACTIVE_LAST_7_DAYS_PAID_PRODUCT_SUBJECT_MATCH_ONLY) as WAU
+FROM EDW.FACT.TEACHER_DAILY_ACTIVITY_COHORTS tdac
+JOIN edw.fact.user_licenses ul
+     ON tdac.USER_KEY=ul.USER_KEY
+     AND tdac.CENSUS_DATE_KEY=ul.LICENSE_DATE_KEY
+     JOIN EDW.DIM.CALENDAR c
+     ON tdac.CENSUS_DATE_KEY = c.DATE_KEY
+JOIN edw.dim.teachers t
+     ON tdac.user_id=t.user_id      
+JOIN edw.dim.schools s
+     ON s.newsela_school_id = t.teacher_preferred_school_id          
+WHERE  tdac.IS_PAID=1
+      AND  tdac.IS_TARGET_TEACHER=1
+      AND ul.TEACHER_SUBJECT_PRODUCT_MATCH=1
+      AND CENSUS_DATE>= '2022-01-24'
+GROUP BY 1, 2, 3, 4, 5, 6, 7
+ORDER BY CENSUS_DATE
+
+           )
+SELECT CENSUS_DATE, state, city, county, DISTRICT_NAME, newsela_district_id, SUM(WAU) as wau
+FROM a
+GROUP BY 1, 2, 3, 4, 5, 6")
+dbDisconnect(con)
+```
+
+## How the Data Looks like
+```{r pressure, echo=FALSE}
+head(mydata) %>% kable()
+```
+
+```{r}
+district_data_point <- mydata %>%
+          filter(!is.na(STATE), !is.na(NEWSELA_DISTRICT_ID)) %>%
+          group_by(CENSUS_DATE, DISTRICT_NAME, NEWSELA_DISTRICT_ID) %>%
+          summarize(wau=sum(WAU)) %>%
+          ungroup()
+district_summary <- mydata %>%
+                    filter(!is.na(STATE), !is.na(NEWSELA_DISTRICT_ID)) %>%
+                    group_by(STATE, DISTRICT_NAME, NEWSELA_DISTRICT_ID) %>%
+                    summarize(wau=sum(WAU)) %>%
+                    ungroup()
+```
+
+## Top absolute value
+```{r}
+top_ten <- district_summary %>% 
+  top_n(20, wau)
+
+top <- top_ten %>%
+  ggplot(aes(fct_reorder(DISTRICT_NAME,wau), wau, fill=STATE))+
+  geom_col()+
+  coord_flip()+
+    xlab("District") +
+    theme_bw()
+
+ggplotly(top)
+```
+```{r, out.width = '100%'}
+ 
+d <-  inner_join(
+  district_data_point,  
+  top_ten,
+  by = "NEWSELA_DISTRICT_ID",
+  keep = FALSE) %>%
+  select(CENSUS_DATE, DISTRICT_NAME.x, NEWSELA_DISTRICT_ID, wau.x, STATE) %>%
+  rename(wau=wau.x, DISTRICT_NAME=DISTRICT_NAME.x)
+
+f <- d  %>%
+  ggplot(aes(CENSUS_DATE, wau, color=DISTRICT_NAME))+
+  geom_line()+
+    xlab("District") +
+    theme_bw()
+
+  ggplotly(f)
+  
+h <-   d  %>%
+  ggplot(aes(CENSUS_DATE, wau, color=DISTRICT_NAME))+
+  geom_point(alpha=1/3)+
+     geom_line(stat="smooth",method = "lm", se=FALSE,
+              alpha = 0.5)
+    xlab("District") +
+    theme_bw()
+
+ ggplotly(h)
+```
+
+```{r}
+by_district <- d %>%
+  dplyr::group_by(STATE, DISTRICT_NAME, NEWSELA_DISTRICT_ID) %>%
+  nest()
+
+```
+
+```{r}
+district_model <- function(df) {
+   cor.test(df$wau , as.numeric(as_date(df$CENSUS_DATE)), data = df) %>% tidy()
+}
+
+by_district <- by_district %>%
+   mutate(model=map(data, district_model))
+head(by_district)
+by_district$model[[2]]
+
+corr_pr <- by_district %>% unnest(model)
+corr_pr
+
+```
+by_district <- by_district %>% 
+  mutate(
+    resids = map2(data, model, add_residuals)
+  )
+  
+#```{r}
+#resids <- unnest(by_district, resids)
+#resids
+#```
+
+#```{r, out.width = '100%'}
+#resids %>% 
+#  ggplot(aes(CENSUS_DATE, resid)) +
+#    geom_line(aes(group = DISTRICT_NAME), alpha = 1 / 3) + 
+#    geom_smooth(se = FALSE)+
+#    facet_wrap(~STATE)
+#```
+
+
+
+#```{r}
+glance_data <- by_district %>% 
+  mutate(glance = map(model, broom::tidy)) %>% 
+  unnest(glance) %>%
+  filter(term=="CENSUS_DATE")
+  
+#```
+
+
+```{r}
+trend <- corr_pr %>%
+  inner_join(top_ten, by="NEWSELA_DISTRICT_ID") %>%
+  select(
+  DISTRICT_NAME.x, NEWSELA_DISTRICT_ID, STATE.x, estimate, p.value, wau) %>%
+  rename(DISTRICT_NAME=DISTRICT_NAME.x, STATE=STATE.x, total_wau=wau) %>%
+  arrange(desc(estimate)) %>%
+  ungroup()
+
+new_trend <- bind_cols(trend, est_group=cut(trend$estimate, breaks = c(-1.1,-0.6,-0.25, 0, 0.25,0.6,1.1), labels = FALSE))
+
+new_trend <- new_trend %>%
+  mutate(
+  cumsumwau=cumsum(total_wau)/sum(total_wau),
+    )
+ 
+new_trend <- new_trend %>% 
+    bind_cols(
+    waucut=cut(new_trend$cumsumwau, breaks =seq(0,1.05, by=0.1), labels = FALSE)
+    ) %>%
+  mutate(new_group= paste0(est_group, waucut))
+  
+
+new_trend <- new_trend %>%
+  select(DISTRICT_NAME,NEWSELA_DISTRICT_ID,	STATE, estimate, p.value, total_wau, est_group, waucut, new_group)
+
+new_trend %>%
+    kable()
+```
+
+```{r , out.width = '100%', fig.height=20}
+trend_line <- corr_pr %>% 
+  unnest(data) %>%
+  ggplot(aes(CENSUS_DATE, wau, color=DISTRICT_NAME))+
+  geom_point(alpha=1/3, aes(size=wau/1000))+
+     geom_line(stat="smooth",method = "lm", se=FALSE,
+              alpha = 1)+
+    xlab("District") +
+    facet_grid(fct_reorder( DISTRICT_NAME, -estimate)~., scales="free_y")
+
+ ggplotly(trend_line)
+```
+
+
+```{r , out.width = '100%', fig.height=20}
+group_trend_line <- corr_pr %>% 
+  unnest(data) %>%
+  filter(p.value< 0.05) %>%
+  inner_join(new_trend, by="NEWSELA_DISTRICT_ID") %>%
+  select(DISTRICT_NAME.x, NEWSELA_DISTRICT_ID, STATE.x, CENSUS_DATE, wau, estimate.x, p.value.x,  new_group) %>%
+  rename(DISTRICT_NAME=DISTRICT_NAME.x, STATE=STATE.x, estimate=estimate.x, p.value= p.value.x) %>%
+  group_by(new_group, CENSUS_DATE) %>%
+  summarise(wau_sum=sum(wau),
+            avg_cor=mean(estimate)) %>%
+  ggplot(aes(CENSUS_DATE, wau_sum, color=new_group))+
+  geom_point(alpha=1/3, aes(size=wau_sum/1000))+
+     geom_line(stat="smooth",method = "lm", se=FALSE,
+              alpha = 1)+
+    xlab("District") +
+    facet_grid(fct_reorder( new_group, -avg_cor)~., scales="free_y")
+
+ ggplotly(group_trend_line)
+```
